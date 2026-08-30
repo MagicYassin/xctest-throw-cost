@@ -108,4 +108,6 @@ for i in 0..<20_000_000 { _ = try? parse(i) }
 
 ---
 
-*Measured on a MacBook Pro M5 · Swift 6.3.3 · macOS 26 · built in release. Surfaced whilst fuzzing the [Kalego](https://github.com/MagicYassin) client. Do check the numbers on your own machine — and open an issue if they differ.*
+*Measured on a MacBook Pro M5 · Swift 6.3.3 · macOS 26 · built in release.* Absolute times will vary with hardware and Swift version, but the *ratio* — throwing under XCTest versus not — is the point. Surfaced whilst fuzzing the [Kalego](https://github.com/MagicYassin) client.
+
+**Reproduced it on your setup?** Open an issue with your numbers — a small table of machines and Swift versions would be genuinely useful.
