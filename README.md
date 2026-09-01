@@ -1,113 +1,301 @@
-# The hidden cost of `throw` (under XCTest)
+# The cost of `throw` under XCTest
 
-**Throwing errors in a tight loop under XCTest is roughly 40× slower than the same code in a plain executable.** XCTest installs a global observer that turns *every* thrown error into an `NSError`, and `try?` does not save you. If you fuzz, run property‑based tests, or benchmark code that throws often, this is quietly costing you hours.
+Under Apple's test frameworks, **every Swift `throw` is intercepted by a global
+runtime hook.** In ordinary tests you never notice it. But if your code throws at
+volume — a fuzzer, a property-based test, a stress suite, or any test that
+exercises error paths millions of times — that hook makes throwing roughly **40×
+slower** and quietly **leaks about 2 KB per throw** until the run runs out of
+memory.
 
-A full write‑up is in **[`the-hidden-cost-of-throw.pdf`](the-hidden-cost-of-throw.pdf)**. This repository is the minimal, runnable reproduction — clone it and check the numbers on your own machine.
+**It costs nothing in a shipped app.** The hook is never installed outside a test
+process, and it never affects correctness. This is a test-time-only sharp edge —
+but a real one, and one that gives you no warning when you hit it.
 
-## The numbers
+This repo is the reproducible proof: the same loops in a plain executable, in an
+XCTest target, and in a Swift Testing target. Clone it and check the numbers on
+your own machine — that is the whole point.
 
-Same loop, 20 million calls, half of them throw. Measured on a MacBook Pro M5, Swift 6.3.3, macOS 26, built in release:
+---
 
-| Context | Time | Relative |
-|---|--:|--:|
-| Executable (`swift run`) | **0.42 s** | ×1 |
-| **XCTest (`swift test`)** | **16.80 s** | **×40** |
-| XCTest, returning `nil` instead of throwing | **0.02 s** | ×0.05 |
+## TL;DR
 
-The only variable is *throw vs `nil`*, and *XCTest vs not*. Returning `nil` under XCTest is ~850× faster than throwing under XCTest — proof that the cost is the `throw`, not the loop.
+**The problem.** XCTest installs an error observer on the Swift runtime's
+`_swift_willThrow` hook. On every throw it captures the call stack and bridges the
+error to an autoreleased `NSError`. That work is fixed per throw (~1.4 µs) and the
+`NSError`s are not freed until the test method ends.
 
-## Where this came from
+**The fix — pick the one that fits:**
 
-This did not surface in a toy micro‑benchmark. It came out of a real workload, and that scale is precisely what exposes it.
+| If you want…                                   | Do this                                              |
+| ---------------------------------------------- | ---------------------------------------------------- |
+| The real fix for fuzzing / stress             | Move the hot loop into an **executable** target      |
+| To keep it in XCTest, fast **and** leak-free  | Run the loop on a **background thread**              |
+| Just to stop the OOM, minimal change          | Wrap the loop body in **`autoreleasepool { }`**      |
+| To stop the leak but keep throwing            | Use **typed throws** `throws(MyError)`               |
+| The error is really a common case             | **Return `nil`** instead of throwing on the hot path |
 
-It turned up whilst fuzzing the client of an encrypted messenger: **eight network‑facing "doors"** (parsers and decoders that take adversary‑chosen rubbish as the *normal* case), **600 million malformed inputs each — 4.8 billion in total — across ten parallel workers.** Three of those eight doors *throw* on rubbish, and rightly so (a hostile proxy response, a corrupt ratchet message, a tampered vault). So "throwing on rubbish" was not rare: it was the common case, hundreds of millions of times over.
-
-The first attempt **stalled**: one core pinned at 100% for over an hour whilst the other nine sat idle. No crash, no warning. At the scale of an ordinary test — a handful of throws — nobody would ever see it. At fuzzing scale, it is catastrophic.
-
-## The symptom
-
-It throws no error and no crash. It shows up as slowness, and misleading slowness at that:
-
-- **A single thread at 100%.** In a parallel test, nine cores finish and one is left alone, flat out, for minutes or hours. It looks like an ordinary straggler, but it isn't keeping pace.
-- **The wall‑clock time balloons.** A run that ought to take minutes takes hours. No message, no clue.
-- **No tool complains.** No crash, no leak, no warning. Memory sits flat.
-- **It scales with the number of throws.** A small test never notices; one that throws millions of times does.
-
-## Diagnosis: see it for yourself
-
-Since there is no error, look at what the stuck thread is *doing*. Without stopping the process, sample its call stacks:
+**Reproduce in 30 seconds** (Apple Silicon, Xcode 26 / Swift 6):
 
 ```sh
-pgrep -f xctest                 # find the test process
-sample <PID> 5 -f /tmp/out.txt  # sample 5 seconds of stacks
+swift run  -c release Bench                     # baseline: fast, no observer
+swift test -c release --filter XCTestBench      # same loops, ~40x slower
 ```
 
-The running thread's stack gives the cause away, from the deepest frame downwards:
+---
+
+## How it was found
+
+It surfaced while fuzzing [Kalego](https://github.com/MagicYassin/kalego), an
+encrypted messenger, against the parsers that read data off the network. Three of
+those parsers *throw* on bad input, by design — so under a fuzzer, throwing was
+not the rare case. It was the common case, hundreds of millions of times.
+
+The run stalled: one core pinned at 100% for over an hour, no crash, no error, no
+leak warning. Because there was nothing to read, the next step was to look at what
+the stuck thread was doing — a stack sample of the live process:
+
+```sh
+pgrep -f xctest
+sample <pid> 5 -f /tmp/sample.txt
+```
+
+The sampled stack named the culprit:
 
 ```
 your loop
-  parse(...)                                  // a function that THROWS
-    swift_willThrowTypedImpl                   <- fires ON the throw
-      XCTSwiftErrorObservation._installErrorObserver
+  parse(...)
+    swift_willThrowTypedImpl            <- fires on every throw
+      XCTSwiftErrorObservation...       <- XCTest is watching
         _swift_stdlib_bridgeErrorToNSError
           _getErrorUserInfoNSDictionary
-            ...CFBasicHashFindBucket, isEqualToString...
 ```
 
-Every time your code throws, XCTest intercepts it and builds a full `NSError`, complete with its `userInfo` dictionary. That is the whole cost, and none of it is yours.
+The loop wasn't slow. Something was intercepting *every throw*.
 
-## Why it happens
+---
 
-XCTest wants to warn you when a test throws an error you did not expect. To do that it installs a **global observer in the Swift runtime, hooked onto `willThrow`** — the point through which every exception passes at the moment it is thrown.
+## Root cause
 
-On each throw, that observer bridges the Swift error to an Objective‑C `NSError`: it allocates memory, builds the `userInfo` dictionary, compares strings. For a test that throws once or twice it is imperceptible. For a loop that throws millions of times it is ruinous — about **1.6 microseconds of pure overhead per throw**.
+The Swift runtime has an internal global variable, `_swift_willThrow` — a
+**function pointer**. The compiler emits, at every `throw` site, the equivalent of
+*"if this pointer isn't null, call it."* In a normal binary the pointer is null,
+so a throw pays nothing for it. (Confirmed: in the `Bench` executable the slot
+reads `nil`.)
 
-> **The detail that catches you out:** `try?` and `do/catch` will **not** save you. The observer fires *on* the throw, before your `catch` receives the error. It makes no difference that you catch it at once — the cost was already paid at the `throw`.
+Test frameworks install themselves there with an atomic swap. This is Swift
+Testing's registration, disassembled:
+
+```
+_swt_setWillThrowHandler:
+    ldr   x8, [GOT: __swift_willThrow]   ; address of the slot
+    swpal x0, x0, [x8]                    ; atomic swap: install, return the old
+    ret
+```
+
+A symbol scan pins down exactly who installs the observer:
+
+| Binary                         | willThrow references | Meaning                                          |
+| ------------------------------ | -------------------- | ------------------------------------------------ |
+| `XCTest.framework`             | 0                    | The framework itself is clean                    |
+| `libXCTestSwiftSupport.dylib`  | 2 + observer         | The hook lives here (`XCTSwiftErrorObservation`) |
+| `Testing.framework`            | 4                    | Swift Testing installs its own, too              |
+
+That last row was contributed by **[u/ThatGuy739](https://www.reddit.com/r/swift/)**,
+who reproduced the slowdown independently, located the hook in the support dylib,
+and pointed out that Swift Testing references `_swift_willThrow` as well — so it is
+not immune. Every measurement here confirms it.
+
+Inside the observer, the per-throw work is: capture the call-stack return
+addresses, bridge the Swift error to an autoreleased `NSError`, and record the
+result under a lock — but **only while inside the block that wraps the running
+test**. That "only inside the test's block" detail explains most of what follows.
+
+---
+
+## The numbers
+
+The same function that throws on half its inputs, and the same loop compiled into
+three hosts. Only the host differs. Release build; time is per loop iteration
+(half of which throw), so the per-*throw* cost is roughly double.
+
+| Host                         | ns / iteration | vs executable |
+| ---------------------------- | -------------: | ------------: |
+| Executable (`Bench`)         |          ~20   |          1×   |
+| Swift Testing (`swift test`) |         ~291   |         ~14×  |
+| XCTest (`swift test`)        |         ~812   |         ~40×  |
+| XCTest (`xcodebuild` / CI)   |        ~1200   |         ~60×  |
+
+The overhead is fixed at **~1.4 µs per actual throw**, and it is **linear** — flat
+from 1M to 8M throws, so the hour-long stall was linear-but-brutal, not a runaway.
+Numbers are from a MacBook Pro M5; yours will differ in absolute terms, but the
+ratios hold. Run it and see.
+
+> **Note on CI.** Under `xcodebuild test` — Xcode's runner, and most CI — Swift
+> Testing is loaded alongside XCTest and the two observers chain, adding ~50% on
+> top. The `swift test` numbers above are the optimistic floor.
+
+---
+
+## The second problem: memory
+
+Speed is an annoyance. The memory is the part that is genuinely wrong, and the one
+finding here that reads as a defect rather than an expensive-by-design trade-off.
+
+Each observed throw bridges to an **autoreleased** `NSError`, and XCTest only
+drains the autorelease pool at the *end* of the test method. Inside one
+long-running test, nothing is freed:
+
+| 2,000,000 throws in one test method | Memory Δ  | Per throw |
+| ----------------------------------- | --------: | --------: |
+| Plain loop                          | +4,031 MB |  2,113 B  |
+| Wrapped in `autoreleasepool`        |    +0 MB  |      0 B  |
+
+Two million throws cost **4 GB**. At fuzzing scale — hundreds of millions of throws
+in a single test — this is not slow, it is an out-of-memory crash. Draining the
+pool per iteration keeps it perfectly flat, which both proves the mechanism and
+hands you a fix. **Swift Testing does not have this leak** (measured flat), because
+it doesn't bridge to `NSError`.
+
+Reproduce (run in its own process — footprint doesn't return to the OS between
+methods):
+
+```sh
+swift test -c release --filter Memory/testMemory_noPool_leaks     # allocates several GB
+swift test -c release --filter Memory/testMemory_withPool_isFlat  # stays flat
+```
+
+---
+
+## You pay for throws you never wrote
+
+A single call into a common Foundation API can throw more than once internally.
+Each internal throw is observed. Counted directly (`Bench` installs a counting
+handler and calls each API once):
+
+| One call to…                                | Internal throws |
+| ------------------------------------------- | --------------: |
+| a hand-written `throw` (control)            |        1        |
+| `JSONDecoder.decode` on malformed input     |        2        |
+| `FileManager.attributesOfItem` (missing)    |        3        |
+| `Int("abc")`, `URL(string:)` — return `nil` |        0        |
+
+So a test that decodes malformed JSON pays roughly double, and one that stats
+missing files pays triple — for throws inside the standard library. This is why
+the problem isn't only a fuzzer's problem: **any test that exercises error paths at
+volume pays it.** Optional-returning APIs (`Int`, `URL`) cost nothing.
+
+---
+
+## Solutions, in detail
+
+Ranked. The first two are the safe answers; the rest are situational.
+
+| Approach                                   | Speed | Memory | Caveat                                                        |
+| ------------------------------------------ | :---: | :----: | ------------------------------------------------------------ |
+| **Move the hot loop to an executable**     |  ✅   |   ✅   | Best for fuzzing / stress. No observer at all.               |
+| **Run the loop on a background thread**    |  ✅   |   ✅   | Throws there aren't attributed to the test — fine for a fuzzer. |
+| Wrap each iteration in `autoreleasepool`   |  ❌   |   ✅   | Stops the OOM even if you stay in XCTest. One line.          |
+| Use typed throws `throws(E)`               |  ❌   |   ✅   | Removes the leak; CPU cost stays.                            |
+| Return `nil` instead of throwing           |  ✅   |   ✅   | Changes the API; right when the "error" is really common.    |
+| Disarm the observer around the loop        |  ✅   |   ✅   | **Sharp — see below.**                                       |
+
+The last one is the clever option and the dangerous one. The observer lives in a
+writable slot, so you can clear it around a hot loop and put it back. It recovers
+full speed (~40× here) — but if you forget to restore it (an early return, a
+thrown error, a crash mid-loop) throw observation stays dead for the rest of the
+process, silently degrading every later test. If you use it, gate it behind
+`defer` and keep the window tiny:
 
 ```swift
-// This does NOT avoid the cost: the throw already happened.
-for x in inputs {
-    _ = try? parse(x)      // <- still paying the observer
+import Foundation
+
+/// Clears the willThrow observer for the duration of `body`, then restores it.
+/// Relies on an internal runtime symbol — pin it to a toolchain and test it.
+func withThrowObserverDisabled<R>(_ body: () -> R) -> R {
+    let slot = dlsym(dlopen(nil, RTLD_NOW), "_swift_willThrow")?
+        .assumingMemoryBound(to: UnsafeRawPointer?.self)
+    let saved = slot?.pointee
+    slot?.pointee = nil
+    defer { slot?.pointee = saved }   // or every later test loses observation
+    return body()
 }
 ```
 
-In a plain executable — or in your shipping app — that observer does not exist. That is why the same code flies outside XCTest.
+If you can't leave XCTest and only need the memory safe, the honest minimum is one
+line: wrap the loop body in `autoreleasepool { }`. If you're fuzzing, don't fight
+it — put the loop in an executable.
+
+---
 
 ## Reproduce it yourself
+
+Requirements: macOS on Apple Silicon, Xcode 26 / Swift 6 (works on 5.9+ as well;
+typed-throw parts need Swift 6).
 
 ```sh
 git clone https://github.com/MagicYassin/xctest-throw-cost
 cd xctest-throw-cost
 
-swift run -c release Bench   # the loop in an executable
-swift test -c release        # the same loop under XCTest (throwing vs nil)
+# 1. Baseline — the executable, no observer. Also prints the API throw-counts.
+swift run -c release Bench
+
+# 2. The same loops under XCTest — ~40x slower, and the disarm workaround.
+swift test -c release --filter XCTestBench
+
+# 3. The same loop under Swift Testing — ~14x, no memory leak.
+swift test -c release --filter swiftTestingThrowCost
+
+# 4. The memory blowup and its fix (run each in its own process).
+swift test -c release --filter Memory/testMemory_noPool_leaks
+swift test -c release --filter Memory/testMemory_withPool_isFlat
 ```
 
-The throwing function and the loop:
+Change the iteration count with `N`:
 
-```swift
-public enum ParseError: Error { case malformed }
-
-@inline(never)
-public func parse(_ x: Int) throws -> Int {
-    if x & 1 == 0 { throw ParseError.malformed }   // throws for half the inputs
-    return x
-}
-
-// identical loop in the test and the executable:
-for i in 0..<20_000_000 { _ = try? parse(i) }
+```sh
+N=20000000 swift run  -c release Bench
+N=20000000 swift test -c release --filter XCTestBench/test1_threeWay
 ```
 
-## How to fix it
+### What's in the package
 
-1. **Move the hot loop out of XCTest.** Put it in an executable or benchmark target. With no observer, a throw costs next to nothing again. Best option for fuzzing and stress tests.
-2. **Return an optional, don't throw.** On paths travelled millions of times, `return nil` instead of `throw` avoids the observer entirely (16.80 s → 0.02 s here).
-3. **If it must stay in XCTest, don't throw in the loop.** Restructure so the exception is genuinely exceptional, not the common case.
+| Path                                              | What it is                                        |
+| ------------------------------------------------- | ------------------------------------------------- |
+| `Sources/ThrowLib`                                | the parsers, the loops, and the measurement helpers |
+| `Sources/Bench`                                   | the executable baseline + the internal-throw counter |
+| `Tests/XCTestBenchTests`                          | the XCTest comparison, memory tests, and workaround |
+| `Tests/SwiftTestingBenchTests`                    | the same loop under Swift Testing                 |
 
-> **The short rule:** XCTest's error observer makes every `throw` cost ~1.6 µs. Fine for hundreds of throws; ruinous for millions. If you are going to throw a great deal, do it outside XCTest.
+The tests **print** their measurements rather than asserting — the point is to
+read the numbers, not to pass or fail.
 
 ---
 
-*Measured on a MacBook Pro M5 · Swift 6.3.3 · macOS 26 · built in release.* Absolute times will vary with hardware and Swift version, but the *ratio* — throwing under XCTest versus not — is the point. Surfaced whilst fuzzing the [Kalego](https://github.com/MagicYassin) client.
+## Scope and caveats
 
-**Reproduced it on your setup?** Open an issue with your numbers — a small table of machines and Swift versions would be genuinely useful.
+- **Shipped apps are unaffected.** The hook is never installed in a normal binary.
+- **Correctness is unaffected.** Assertions and `XCTUnwrap` failures record through
+  a separate path; disarming the observer does not hide them.
+- **Absolute times are hardware-dependent.** Compare ratios, and measure on your
+  own machine.
+- The disarm workaround relies on an internal, undocumented runtime symbol
+  (`_swift_willThrow`). It may change between toolchains. Treat it as a last resort.
+
+---
+
+## Credits
+
+- **Yassin Daoud** — [@MagicYassin](https://github.com/MagicYassin) — found it while
+  fuzzing Kalego, and ran the investigation.
+- **u/ThatGuy739** (r/swift) — reproduced it independently, located the hook in
+  `libXCTestSwiftSupport.dylib`, and flagged that Swift Testing hooks
+  `_swift_willThrow` too. The thread's most valuable contribution.
+- **u/Dry_Hotel1100** (r/swift) — pushed the hardest questions (is a test's elapsed
+  time even a valid criterion? could this be MainActor hops?), which is exactly
+  what forced the rule-out experiments.
+
+Discussion: the original [r/swift thread](https://www.reddit.com/r/swift/comments/1w2f07n/the_hidden_cost_of_throw_in_xctest_40x_slower/).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
