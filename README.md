@@ -15,6 +15,9 @@ This repo is the reproducible proof: the same loops in a plain executable, in an
 XCTest target, and in a Swift Testing target. Clone it and check the numbers on
 your own machine — that is the whole point.
 
+> Prefer to read it as a designed document? The full write-up is also here as a
+> PDF: **[the-willthrow-tax.pdf](the-willthrow-tax.pdf)**.
+
 ---
 
 ## TL;DR
