@@ -229,8 +229,8 @@ it — put the loop in an executable.
 
 ## Reproduce it yourself
 
-Requirements: macOS on Apple Silicon, Xcode 26 / Swift 6 (works on 5.9+ as well;
-typed-throw parts need Swift 6).
+Requirements: macOS on Apple Silicon, Xcode 26 / Swift 6 (the package manifest is
+`swift-tools-version: 6.0`, and the typed-throw example needs Swift 6).
 
 ```sh
 git clone https://github.com/MagicYassin/xctest-throw-cost

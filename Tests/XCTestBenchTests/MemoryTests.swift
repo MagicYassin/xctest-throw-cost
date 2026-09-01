@@ -1,6 +1,6 @@
 import XCTest
 import Foundation
-@testable import ThrowLib
+import ThrowLib
 
 // The memory side of the bug — the one part that is a genuine defect.
 //

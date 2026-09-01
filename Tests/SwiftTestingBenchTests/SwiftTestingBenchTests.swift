@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import ThrowLib
+import ThrowLib
 
 // The same throwing loop under Swift Testing, for the three-way comparison.
 //

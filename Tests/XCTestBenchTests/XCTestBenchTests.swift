@@ -1,6 +1,6 @@
 import XCTest
 import Foundation
-@testable import ThrowLib
+import ThrowLib
 
 // The SAME loops as the executable, now under XCTest. Compare the printed
 // ns/it here against `swift run -c release Bench`.
